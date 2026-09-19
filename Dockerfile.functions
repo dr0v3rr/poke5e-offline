@@ -1,0 +1,9 @@
+# Assemble the edge-function tree into one image: poke5e's own functions
+# (from the cloned source) plus our dispatch router and fallback import map.
+# Baking avoids nesting bind mounts inside a read-only parent (which Docker
+# cannot create mountpoints in) and makes `update.sh` rebuilds deterministic.
+FROM supabase/edge-runtime:v1.76.2
+
+COPY poke5e-src/supabase/functions/ /home/deno/functions/
+COPY volumes/functions/main/ /home/deno/functions/main/
+COPY volumes/functions/deno.jsonc /home/deno/functions/deno.jsonc

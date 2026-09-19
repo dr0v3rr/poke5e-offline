@@ -1,0 +1,250 @@
+# poke5e-offline — a fully self-hosted, offline poke5e.app on Docker.
+#
+# Replaces hosted Supabase with the same open-source components Supabase
+# itself ships (Postgres + GoTrue + PostgREST + Storage) plus MinIO for
+# S3 assets and the poke5e edge function on Deno. One nginx gateway serves
+# the built SvelteKit site AND proxies the Supabase API on a single origin.
+#
+# Do not run `docker compose up` directly the first time — use scripts/setup.sh,
+# which clones the poke5e source (frontend/function/migrations) that several
+# services build from and bind-mount.
+
+name: poke5e-offline
+
+services:
+  # ---------------------------------------------------------------- database
+  db:
+    container_name: poke5e-db
+    image: supabase/postgres:15.8.1.085
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: ${POSTGRES_PORT}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      POSTGRES_DB: ${POSTGRES_DB}
+      JWT_EXP: ${JWT_EXPIRY}
+    volumes:
+      # Set login passwords for the roles the image pre-creates.
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      - db_data:/var/lib/postgresql/data
+      # Persist the pgsodium root key between restarts.
+      - db_config:/etc/postgresql-custom
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+
+  # ---------------------------------------------------------- auth (GoTrue)
+  # poke5e itself uses no login/auth, but keeping GoTrue guarantees the full
+  # `auth` schema exists that Storage RLS and PostgREST assume.
+  auth:
+    container_name: poke5e-auth
+    image: supabase/gotrue:v2.196.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9999/health"]
+      timeout: 5s
+      interval: 5s
+      retries: 5
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${APP_ORIGIN}/auth/v1
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      GOTRUE_SITE_URL: ${APP_ORIGIN}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_ISSUER: ${APP_ORIGIN}/auth/v1
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "false"
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+
+  # ------------------------------------------------------- REST (PostgREST)
+  # poke5e only calls stored-procedure RPCs (/rest/v1/rpc/*).
+  rest:
+    container_name: poke5e-rest
+    image: postgrest/postgrest:v14.17
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS}
+      # Must include `extensions` so RPCs can find pgcrypto's gen_random_bytes()
+      # (used to mint trainer/fakemon keys). Mirrors poke5e's supabase config.toml.
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY}
+    command: ["postgrest"]
+
+  # ------------------------------------------------------ storage (file backend)
+  # Serves the trainer-avatar bucket. Backed by a local volume (not MinIO) so
+  # no S3 round-trip is involved for this path. Image transformation is off, so
+  # imgproxy is not needed.
+  storage:
+    container_name: poke5e-storage
+    image: supabase/storage-api:v1.74.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    healthcheck:
+      # 127.0.0.1 (not localhost): the image's busybox wget resolves localhost to
+      # ::1 first, but storage-api binds IPv4 0.0.0.0 only.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      timeout: 5s
+      interval: 5s
+      retries: 10
+      start_period: 10s
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      STORAGE_PUBLIC_URL: ${APP_ORIGIN}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      GLOBAL_S3_BUCKET: stub
+      REGION: stub
+      TENANT_ID: poke5e-offline
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET}
+    volumes:
+      - storage_data:/var/lib/storage
+
+  # ------------------------------------------------------- edge function (Deno)
+  # Runs poke5e's `user-assets` function (presigns MinIO upload URLs).
+  functions:
+    container_name: poke5e-functions
+    build:
+      context: .
+      dockerfile: Dockerfile.functions
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_started
+    volumes:
+      - deno_cache:/root/.cache/deno
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      VERIFY_JWT: "false"
+      # The function's supabase-js client calls RPCs back through the gateway.
+      SUPABASE_URL: http://gateway
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      # S3 (MinIO) config for presigning. S3_ENDPOINT MUST be the public origin
+      # because the browser uploads directly to the presigned URL.
+      S3_ENDPOINT: ${APP_ORIGIN}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET_NAME: user-assets
+    command: ["start", "--main-service", "/home/deno/functions/main"]
+
+  # ---------------------------------------------------------- MinIO (S3 assets)
+  # Built from poke5e's own minio image, which creates the public `user-assets`
+  # bucket on startup.
+  minio:
+    container_name: poke5e-minio
+    build:
+      context: ./poke5e-src/minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_REGION: ${MINIO_REGION}
+    ports:
+      # Admin console only; the S3 API is reached via the gateway at /user-assets.
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+
+  # -------------------------------------------------------- migrator (one-shot)
+  # Applies poke5e's DB migrations idempotently, then seeds on first init.
+  # Re-run any time (scripts/update.sh does) — already-applied migrations skip.
+  migrator:
+    container_name: poke5e-migrator
+    image: postgres:15-alpine
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./scripts/migrate.sh:/migrate.sh:ro
+      - ./poke5e-src/supabase/migrations:/migrations:ro
+      - ./poke5e-src/supabase/seed.sql:/seed.sql:ro
+    entrypoint: ["sh", "/migrate.sh"]
+
+  # ------------------------------------------------------ gateway (nginx + site)
+  # Builds the SvelteKit static site and serves it, and reverse-proxies the
+  # Supabase API + MinIO on the same origin. This is the ONE published port.
+  gateway:
+    container_name: poke5e-gateway
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        PUBLIC_SUPABASE_URL: ${APP_ORIGIN}
+        PUBLIC_SUPABASE_KEY: ${ANON_KEY}
+        PUBLIC_USER_ASSETS_BASE_URL: ${APP_ORIGIN}/user-assets
+        PUBLIC_ANALYTICS_ENABLED: "false"
+    restart: unless-stopped
+    depends_on:
+      rest:
+        condition: service_started
+      auth:
+        condition: service_started
+      storage:
+        condition: service_healthy
+      functions:
+        condition: service_started
+      minio:
+        condition: service_started
+      migrator:
+        condition: service_completed_successfully
+    ports:
+      - "${APP_PORT:-9000}:80"
+
+volumes:
+  db_data:
+  db_config:
+  storage_data:
+  minio_data:
+  deno_cache:

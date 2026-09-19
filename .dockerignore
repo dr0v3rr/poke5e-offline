@@ -1,0 +1,8 @@
+# Keep the frontend build context small and reproducible.
+.git
+poke5e-src/.git
+poke5e-src/node_modules
+poke5e-src/build
+poke5e-src/.svelte-kit
+**/node_modules
+**/.DS_Store

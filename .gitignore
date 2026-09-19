@@ -1,0 +1,5 @@
+# Local secrets and cloned upstream source (pulled by scripts/setup.sh)
+.env
+.env.bak
+.env.old
+poke5e-src/
