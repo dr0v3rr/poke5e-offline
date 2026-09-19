@@ -60,6 +60,8 @@ Run these from inside the `poke5e-offline` folder.
 | **See status** | `docker compose ps` |
 | **View logs** | `docker compose logs -f` |
 | **Update** to the latest poke5e | `sh scripts/update.sh latest` |
+| **Back up** all your data | `sh scripts/backup.sh` |
+| **Restore** a backup | `sh scripts/restore.sh <label>` |
 | **Reset everything** (⚠️ deletes all data) | `docker compose down -v` then `sh scripts/setup.sh` |
 
 > **Your data is safe across `docker compose down` and restarts.** It only gets
@@ -85,7 +87,32 @@ It fetches the new source, rebuilds, applies only the **new** database changes
 
 ---
 
-## 5. Using it from other devices (optional)
+## 5. Backups
+
+Everything you create lives in Docker volumes on this machine. To protect against
+accidental loss (or before a big change), take a snapshot:
+
+```bash
+sh scripts/backup.sh                 # snapshot named by date/time
+sh scripts/backup.sh before-update   # or give it your own label
+```
+
+A snapshot captures **all** your data — trainers, teams, and uploaded images —
+into `./backups/<label>/`. It briefly pauses the app so the snapshot is
+consistent, then resumes.
+
+To see your snapshots or restore one:
+
+```bash
+sh scripts/restore.sh                 # lists available snapshots
+sh scripts/restore.sh before-update   # restores it (asks you to confirm)
+```
+
+> Restoring **replaces** current data with the snapshot, so the script asks you
+> to type `yes` first. Backups stay on your machine and are never pushed to git.
+> Tip: run `sh scripts/backup.sh` before `sh scripts/update.sh`.
+
+## 6. Using it from other devices (optional)
 
 By default it's reachable only at `localhost:9000`. To open it to other devices
 on your home network:
@@ -102,7 +129,7 @@ Now anyone on your network can reach it at `http://192.168.1.50:9000`.
 
 ---
 
-## 6. Security / secrets
+## 7. Security / secrets
 
 `.env` ships with **default development secrets** so it works out of the box on
 your own machine. If you put this anywhere beyond localhost, rotate them first:
@@ -116,7 +143,7 @@ first run). Your real `.env` is never committed to git.
 
 ---
 
-## 7. How it works (for the curious)
+## 8. How it works (for the curious)
 
 Everything is served from one web address (`:9000`) by an nginx gateway that
 also proxies the backend, so there's no cross-origin setup:

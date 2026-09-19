@@ -3,3 +3,6 @@
 .env.bak
 .env.old
 poke5e-src/
+
+# Local data snapshots (created by scripts/backup.sh) — never push these
+backups/
